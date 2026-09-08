@@ -16,7 +16,8 @@
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
-
+-- 去掉NO_ZERO_DATE，兼容5.6/5.7/8.0，无废弃参数
+SET sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
 -- ----------------------------
 -- Table structure for tb_blog
 -- ----------------------------

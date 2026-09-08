@@ -3,15 +3,33 @@ server:
 spring:
   application:
     name: hmdp
+  rabbitmq:
+    host: ${RABBITMQ_HOST:127.0.0.1}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME}
+    password: ${RABBITMQ_PASSWORD}
+    virtual-host: ${RABBITMQ_VIRTUAL_HOST:/}
+    connection-timeout: 5s
+    publisher-confirm-type: none
+    publisher-returns: false
+    template:
+      retry:
+        enabled: false
+    listener:
+      simple:
+        acknowledge-mode: auto
+        default-requeue-rejected: false
+        retry:
+          enabled: false
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
     url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC
     username: root
-    password: 123
+    password: root
   redis:
-    host: 192.168.150.101
-    port: 6379
-    password: 123321
+    host: 127.0.0.1
+    port: ${REDIS_PORT:6380}
+#    password: 123321
     lettuce:
       pool:
         max-active: 10
