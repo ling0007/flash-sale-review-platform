@@ -110,6 +110,8 @@ class SeckillMigrationTest {
         org.springframework.amqp.core.Message message = config.rabbitMessageConverter()
                 .toMessage(dto, new MessageProperties());
         assertEquals("application/json", message.getMessageProperties().getContentType());
+        assertEquals(org.springframework.amqp.core.MessageDeliveryMode.PERSISTENT,
+                message.getMessageProperties().getDeliveryMode());
         assertEquals(dto, config.rabbitMessageConverter().fromMessage(message));
         assertTrue(config.seckillExchange().isDurable());
         assertTrue(config.seckillOrderQueue().isDurable());

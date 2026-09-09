@@ -17,6 +17,7 @@ public class VoucherOrderListener {
     @RabbitListener(queues = SeckillMqConstants.QUEUE)
     public void onMessage(VoucherOrderMessage message) {
         log.info("Received seckill order: {}", message);
+        // Service 事务提交后才返回；异常交给 Consumer Retry，禁止 catch 后仅打印日志导致误 ACK。
         voucherOrderService.createVoucherOrder(message);
     }
 }

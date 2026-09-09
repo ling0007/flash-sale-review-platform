@@ -20,7 +20,13 @@ spring:
         acknowledge-mode: auto
         default-requeue-rejected: false
         retry:
-          enabled: false
+          enabled: true
+          # 事务在每次 Listener 调用内部开启，失败回滚后才进行下一次尝试。
+          stateless: true
+          max-attempts: 3
+          initial-interval: 1s
+          multiplier: 2
+          max-interval: 4s
   datasource:
     driver-class-name: com.mysql.jdbc.Driver
     url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC

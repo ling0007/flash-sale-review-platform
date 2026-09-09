@@ -80,7 +80,7 @@
 - Listener 生命周期交给 Spring AMQP，订单核心仍在 Service。独立事务 Bean 修复了实际存在的数据库原子性缺口；JSON DTO 避免数据库字段变化隐式改变消息体。
 - 实测 15 个测试通过且 package 成功，覆盖真实 Controller/Lua/MQ/MySQL、无库存、重复用户、插单冲突回滚、无旧线程，以及商铺/分类/热门笔记与原有简单/Redisson 测试。控制台已核对 direct/durable 和绑定；不可达 broker 启动退出码 1。
 - 不宣称可靠交付或性能提升。发送窗口无补偿，消费失败无重试/DLQ，历史 Stream 未完成记录需要切换时核对；完整上传、关注流程未在此阶段回归。
-- 详见 [审计与验收](seckill-rabbitmq-migration.md)，其中区分真实集成验证与 mock 测试。
+- 详见 [审计与验收](任务总结/seckill-rabbitmq-migration.md)，其中区分真实集成验证与 mock 测试。
 
 ### 6. 面试复盘
 
@@ -89,3 +89,42 @@
 3. 为什么现在不开 Confirm？阶段范围先验证链路；因此返回 orderId 不代表 broker 已确认，更不代表 MySQL 已落库。
 4. durable 能保证不丢消息吗？不能覆盖发送前崩溃、跨 Redis/MQ 原子性、消费失败丢弃等问题。
 5. 为什么关 retry 还要关 requeue？它们是不同机制；只关 Spring Retry 仍可能被容器默认重新入队。
+
+## [2026-09-09] RabbitMQ 消费端有限重试、错误队列与订单幂等
+
+### 1. 背景 / 问题
+
+- 上阶段迁移已能真实下单，但消费错误直接拒绝且不重新入队，缺少失败消息保存；数据库仅有订单主键，没有用户/优惠券联合唯一约束。重复投递和并发查重需要最终数据库保障。
+- 本阶段复跑原真实主链路测试通过，确认 DTO/拓扑常量统一、Stream 运行代码不存在；迁移前数据库重复业务键组合数为 0。
+
+### 2. 方案选择
+
+- 使用 Spring AUTO ACK 和 stateless Consumer Retry，最多三次尝试，等待 1 秒、2 秒。核对 Spring AMQP 2.2.18 和 Boot 2.3.12：数据库事务在每次 retry callback 内开启并结束，不存在包住所有尝试的外层事务，因而选择 stateless。
+- 耗尽后使用框架 RepublishMessageRecoverer 向持久错误拓扑转发原消息、异常栈和原路由；禁止无限 requeue，不引入手写 ACK 或第二套重试循环。
+- 保留 Lua 前置拦截和用户锁，数据库 UNIQUE(user_id, voucher_id) 兜底。Confirm/Return、发送重试、补偿、延迟订单和对账继续排除在范围外。
+
+### 3. 核心实现
+
+- 在业务事务方法外捕获 DuplicateKeyException，确认事务已回滚后再查业务键，已有相应订单才作为幂等成功。主键碰撞但无同业务订单仍失败，避免宽泛吞掉数据完整性异常。
+- 库存使用 stock > 0 条件更新，与 INSERT 同一事务；并发 UNIQUE 失败会回滚本次库存修改。新增一次性增量 SQL 并更新新建库 SQL，已在本机数据库执行索引迁移，没有删除历史记录。
+- 错误交换机 hmdp.error.direct、队列 hmdp.seckill.error.queue 和路由 seckill.order 均使用常量和代码声明。正常消息验证默认 PERSISTENT，Recoverer 显式持久化；Listener 继续只委托 Service，不 catch 吞异常。
+
+### 4. 遇到的坑
+
+- 首版真实故障注入使用 @SpyBean Mapper，测试上下文启动失败 → 当前 Mockito 无法 spy JDK final 代理 → 从堆栈定位 Mapper 代理 → 改用仅测试生效的 Spring BeanPostProcessor/MethodInterceptor 包装真实 Mapper。保留所有异常注入、数据库访问及回滚断言，没有移除失败场景。
+- 仅用 Redis 锁下的并发消息不足以证明 UNIQUE 兜底 → 增加测试限定的“锁不互斥”模拟和双查重屏障，强制触发一次真实 MySQL 唯一键异常，再断言两个 Service 调用都成功且库存只扣一次。
+
+### 5. 为什么这样改
+
+- 瞬时失败可在有限次数内恢复；持续失败在错误队列保留诊断上下文。数据库唯一约束与正确事务边界保护重复投递下的业务效果，不依赖查重请求恰好串行。
+- 实测完整筛选套件 23 tests、0 failures、0 errors、0 skipped，Maven package 成功；覆盖正常消费、顺序重投、并发重复、真实唯一冲突回滚、临时故障退避与独立事务、持续故障错误转发、消费者连接重建，以及原非秒杀回归。
+- 数据库提交后 ACK 丢失仍会重投；Redis/MQ 预扣发送窗口、错误转发没有 Confirm 的窗口仍存在。错误队列没有自动修复或 Redis 补偿，不能宣称消息绝不丢失或端到端 exactly-once。
+- 除自动测试的消费者停启/连接重建外，实际停止并重启打包应用进程，未消费消息保留；重启后样例三次尝试耗尽转入错误队列。浏览器核实持久消息、原 JSON 和异常上下文；样例有独立验收标记，未产生数据库订单。不据此声称完成 broker 宿主机断电恢复验证。详细操作与验收见 [消费端可靠性说明](任务总结/seckill-consumer-reliability.md)。
+
+### 6. 面试复盘
+
+1. 有事务为什么仍选 stateless？看嵌套关系；本项目事务在每次尝试内部开启，回滚完成后重试，无需跨重投递维护事务状态。
+2. 唯一键异常为什么必须穿过事务边界？需要同时回滚之前的库存 UPDATE；事务内 catch 后正常返回可能错误提交扣库存。
+3. 重试三次具体是什么？包括首次，总共三次调用，中间等待 1 秒、2 秒，不是首次加三次重试。
+4. 错误队列与 DLX 是否相同？这里由应用 Recoverer 主动转发并加上下文，成功返回后原消息 ACK，没有配置 broker DLX。
+5. 持久化是否代表发送可靠？不是；durable/persistent 保护已接收的拓扑和消息，但没有发布确认时不能覆盖发送/错误转发窗口。

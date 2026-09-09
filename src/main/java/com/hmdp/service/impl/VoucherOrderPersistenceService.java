@@ -18,12 +18,12 @@ public class VoucherOrderPersistenceService {
 
     @Transactional
     public void createVoucherOrder(VoucherOrder order) {
-        Integer count = voucherOrderMapper.selectCount(new QueryWrapper<VoucherOrder>()
-                .eq("user_id", order.getUserId()).eq("voucher_id", order.getVoucherId()));
-        if (count > 0) {
+        // 查询是重复投递的快捷路径，无法单独防止并发；最终由 MySQL UNIQUE 兜底。
+        if (orderExists(order.getUserId(), order.getVoucherId())) {
             log.info("Order already exists for user={}, voucher={}", order.getUserId(), order.getVoucherId());
             return;
         }
+        // 条件更新防超卖。插单失败必须抛出事务边界，让这次扣库存一起回滚。
         boolean success = seckillVoucherService.update().setSql("stock = stock - 1")
                 .eq("voucher_id", order.getVoucherId()).gt("stock", 0).update();
         if (!success) {
@@ -32,5 +32,10 @@ public class VoucherOrderPersistenceService {
         if (voucherOrderMapper.insert(order) != 1) {
             throw new IllegalStateException("Failed to insert voucher order: " + order.getId());
         }
+    }
+
+    public boolean orderExists(Long userId, Long voucherId) {
+        return voucherOrderMapper.selectCount(new QueryWrapper<VoucherOrder>()
+                .eq("user_id", userId).eq("voucher_id", voucherId)) > 0;
     }
 }

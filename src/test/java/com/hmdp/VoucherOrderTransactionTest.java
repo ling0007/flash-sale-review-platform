@@ -14,6 +14,7 @@ import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.AnnotationTransactionAttributeSource;
 import org.springframework.transaction.interceptor.TransactionInterceptor;
@@ -81,6 +82,24 @@ class VoucherOrderTransactionTest {
         doReturn(0).when(mapper).insert(any(VoucherOrder.class));
         assertThrows(IllegalStateException.class, () -> orders.createVoucherOrder(message));
         assertTrue(transactions.rolledBack);
+    }
+
+    @Test
+    void businessDuplicateRollsBackBeforeBeingAcknowledgedAsSuccess() {
+        when(mapper.selectCount(any())).thenReturn(0, 1);
+        doThrow(new DuplicateKeyException("business unique key")).when(mapper).insert(any(VoucherOrder.class));
+        orders.createVoucherOrder(message);
+        assertTrue(transactions.rolledBack);
+        assertFalse(transactions.committed);
+        verify(lock).unlock();
+    }
+
+    @Test
+    void unrelatedPrimaryKeyCollisionMustNotBeAcknowledgedAsDuplicate() {
+        doThrow(new DuplicateKeyException("unrelated primary key")).when(mapper).insert(any(VoucherOrder.class));
+        assertThrows(DuplicateKeyException.class, () -> orders.createVoucherOrder(message));
+        assertTrue(transactions.rolledBack);
+        verify(lock).unlock();
     }
 
     @Test
