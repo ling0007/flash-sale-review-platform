@@ -18,7 +18,8 @@ public class VoucherOrderPersistenceService {
 
     @Transactional
     public void createVoucherOrder(VoucherOrder order) {
-        // 查询是重复投递的快捷路径，无法单独防止并发；最终由 MySQL UNIQUE 兜底。
+        // 快速校验：用户是否已买过该券，提前拦截重复消息
+        // 普通查询无锁，并发时会失效，最终靠数据库唯一索引保证一人一单
         if (orderExists(order.getUserId(), order.getVoucherId())) {
             log.info("Order already exists for user={}, voucher={}", order.getUserId(), order.getVoucherId());
             return;

@@ -1,187 +1,192 @@
-# 秒杀 RabbitMQ 消费可靠性：初学者面试导读
+# 从 Redis Lua 到 RabbitMQ：秒杀异步下单面试教程
 
-这份导读帮助你把本项目的“Redis Lua + RabbitMQ 异步下单”讲清楚。目标不是背术语，而是能从一次真实订单消息出发，解释它为什么能异步、何时确认、失败怎么办、重复投递为什么不会多扣库存，以及哪些问题目前还没有解决。
+这篇文章带你按一次真实秒杀请求读懂本项目的改造。每一步都回答三个问题：代码做了什么？为什么这样做？失败或重复时会怎样？配套阅读：[消费可靠性设计](../任务总结/seckill-consumer-reliability.md)、[工程演进日志](../engineering-log.md)、[面试复盘](../interview-notes.md)。
 
-开始前建议先读 [消费端可靠性与幂等](../任务总结/seckill-consumer-reliability.md)。它记录了当前实现、真实测试和限制；[工程演进日志](../engineering-log.md) 记录了从 Redis Stream 迁移到 RabbitMQ 的原因和过程；[项目面试复盘](../interview-notes.md) 适合作为考前速记。
+## 先建立整体认识
 
-## 先用一句话理解项目
+请求先进入 Redis Lua。脚本原子完成库存、一人一单、Redis 预扣和抢购资格记录；成功后 Java 把同一个 orderId、userId、voucherId 封装成消息发到 RabbitMQ，接口立即返回。Listener 收到消息后调用订单 Service，Service 在 MySQL 一个事务内条件扣库存并创建订单。失败最多重试三次，仍失败就进入错误队列；重复消息由 MySQL 唯一索引和事务保证幂等。
 
-用户请求秒杀时，Redis Lua 先原子判断库存和一人一单，并预扣 Redis 库存。通过判断后，应用发送一条订单消息到 RabbitMQ，接口立即返回 orderId。消费者收到消息后，在 MySQL 事务内做条件扣库存和创建订单；如果消费失败，先做有限次数本地重试，仍失败就保留到错误队列；如果消息重复，MySQL 唯一索引保证最终只会有一个用户-券订单。
+~~~text
+HTTP → Redis Lua → RabbitTemplate → RabbitMQ
+     → Listener → 事务 Service → MySQL
+~~~
 
-把这段话拆开，才是面试官真正会追问的内容。
+接口返回 orderId 只表示 Lua 成功且发送调用正常返回，不表示 MySQL 已提交。本阶段没有 Publisher Confirm、Return、生产者阻塞重试或补偿。
 
-## 文件阅读顺序
+## 按什么顺序读代码
 
-不要一上来读完整 Service。按下面顺序，每一步先回答“输入是什么、输出是什么、失败会发生什么”。
+### 1. 先读消息路由：SeckillMqConstants
 
-| 顺序 | 文件 | 阅读重点 | 读完应能回答 |
-|---|---|---|---|
-| 1 | [SeckillMqConstants.java](../src/main/java/com/hmdp/utils/SeckillMqConstants.java) | 主交换机、业务队列、路由键和错误拓扑的统一名称 | 一条订单消息从哪里进、失败后去哪里？ |
-| 2 | [VoucherOrderMessage.java](../src/main/java/com/hmdp/dto/VoucherOrderMessage.java) | 消息契约只有 orderId、userId、voucherId | 为什么不能把 `VoucherOrder` 实体直接发到 MQ？ |
-| 3 | [seckill.lua](../src/main/resources/seckill.lua) | Redis 库存判断、Set 一人一单、预扣 | Lua 解决了什么并发问题，又没有解决什么？ |
-| 4 | [VoucherOrderServiceImpl.java](../src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java) | 生成 orderId、执行 Lua、发送消息、用户锁、重复键异常的事务外处理 | 什么情况下接口返回 orderId，是否表示 MySQL 已成功？ |
-| 5 | [SeckillRabbitConfig.java](../src/main/java/com/hmdp/config/SeckillRabbitConfig.java) | durable 拓扑、JSON converter、Recoverer | 错误消息包含什么，为什么需要单独错误队列？ |
-| 6 | [application.yaml](../src/main/resources/application.yaml) | AUTO ACK、3 次 stateless retry、1 秒/2 秒 backoff、不无限 requeue | 重试三次到底是三次还是四次？ |
-| 7 | [VoucherOrderListener.java](../src/main/java/com/hmdp/listener/VoucherOrderListener.java) | Listener 只做日志和委托，不吞异常 | 为什么 Listener 不能 catch 后只记录日志？ |
-| 8 | [VoucherOrderPersistenceService.java](../src/main/java/com/hmdp/service/impl/VoucherOrderPersistenceService.java) | `@Transactional`、查重、`stock > 0` 条件 UPDATE、INSERT | 事务为什么放到独立 Bean？ |
-| 9 | [增量索引 SQL](../src/main/resources/db/migration/20260909_voucher_order_unique.sql) 和 [建表 SQL](../src/main/resources/db/hmdp.sql) | `(user_id, voucher_id)` UNIQUE；已有库的部署前检查 | Redis 已经一人一单，为什么仍要数据库 UNIQUE？ |
-| 10 | [SeckillConsumerReliabilityTest.java](../src/test/java/com/hmdp/SeckillConsumerReliabilityTest.java) | 六项真实 Redis/RabbitMQ/MySQL 验收 | 代码声称“幂等”时，如何证明而不是相信？ |
+阅读 [SeckillMqConstants.java](../../src/main/java/com/hmdp/utils/SeckillMqConstants.java)。
 
-阅读第 4、7、8 步时，把调用关系画成一条线：`Listener → VoucherOrderServiceImpl → VoucherOrderPersistenceService`。只有最后一个类的方法带 `@Transactional`，而且它通过另一个 Spring Bean 被调用，所以事务代理才会生效。
+问题：正常消息和失败消息分别去哪？
 
-## 一条消息的生命周期
+答案：正常消息发到 hmdp.seckill.direct，用 seckill.order.create 路由到 hmdp.seckill.order.queue；三次处理失败后，Recoverer 用 seckill.order 把消息转到 hmdp.error.direct 和 hmdp.seckill.error.queue。常量集中定义，避免生产者、消费者和配置各写一套字符串。
 
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant R as Redis Lua
-    participant Q as RabbitMQ
-    participant L as Listener
-    participant S as 订单 Service
-    participant DB as MySQL
-    participant E as 错误队列
+### 2. 再读消息契约：VoucherOrderMessage
 
-    U->>R: 校验库存与一人一单，预扣库存
-    R-->>U: 成功
-    U->>Q: 发送 VoucherOrderMessage
-    U-->>U: 返回 orderId
-    Q->>L: 投递消息
-    L->>S: 调用创建订单
-    S->>DB: 事务内条件扣库存 + INSERT 订单
-    alt 事务提交成功或已存在同业务订单
-        S-->>L: 正常返回
-        L-->>Q: AUTO ACK
-    else 瞬时异常
-        S-->>L: 抛异常，事务回滚
-        L->>S: 本地重试，最多 3 次
-    else 重试耗尽
-        L->>E: Recoverer 转发原消息和失败上下文
-        L-->>Q: 转发返回后 ACK 原消息
-    end
-```
+阅读 [VoucherOrderMessage.java](../../src/main/java/com/hmdp/dto/VoucherOrderMessage.java)。
 
-这里有两个容易混淆的点。
+问题：为什么不直接发送 VoucherOrder 实体？
 
-第一，接口返回 orderId 只表示 Lua 已允许抢购，而且 `RabbitTemplate.convertAndSend()` 调用正常返回；它不表示 RabbitMQ 已经通过 Confirm 确认，也不表示消费者已经把订单写入 MySQL。本阶段按要求没有 Confirm、Return、生产者阻塞重试或补偿。
+答案：单独写消息 DTO，只传必要的三个 id：订单 id、用户 id、优惠券 id。
+一是消息内容更小，传输更快；二是数据库怎么改，不会影响 MQ 消息格式；三是也不会把数据库内部字段泄露到消息中间件。
 
-第二，AUTO ACK 不是“消息一到就 ACK”。本项目中，Listener 方法正常返回才会被框架视为成功。事务在 Service 内提交失败会抛回 Listener；Listener 不吞异常，因此不会错误确认。
 
-## 必须真正理解的五个知识点
+### 3. 读 Lua：它快，但不是最终事实
 
-### 1. Redis Lua：快，但不是最终订单事实
+阅读 [seckill.lua](../../src/main/resources/seckill.lua)，找库存判断、用户 Set、DECRBY 和资格记录。
 
-Lua 在 Redis 内一次执行库存检查、用户是否已抢、库存减一、用户加入资格 Set，避免多条 Redis 命令在并发时被穿插。它适合做高并发入口过滤，能快速拒绝库存不足和同用户重复请求。
+问题：为什么必须用 Lua？Lua 成功是不是订单已经落库？
 
-但 Lua 的结果只是 Redis 侧的资格和预扣，不是最终订单。RabbitMQ 可能重复投递，MySQL 可能有其他写入入口，Redis 与 MQ 也不是同一事务。因此 Redis 不能替代数据库唯一约束。
+答案：如果分开写多条 Redis 命令：查库存、判断用户是否抢购、扣库存。高并发的时候，多条命令中间会插进别的用户请求。就会出现超卖，或者同一个用户抢到多张券。
+Lua 脚本是在 Redis 服务端一次性全部跑完，中间不会被别的请求打断，具备原子性，就能避免上面这些并发问题。
+但 Lua 执行成功，只是代表 Redis 这边校验通过，不代表订单已经存到数据库，真正库存以 MySQL 为准。
+问题：Lua 成功是不是订单已经落库？
+。
 
-### 2. 至少一次消费与幂等
+### 4. 读入口 Service：找 orderId 和生产者
 
-消息系统常见的是“至少一次”语义：例如 MySQL 已提交，但 ACK 因进程断连没有送达，broker 可能再次投递同一条消息。正确目标不是假装消息只来一次，而是让重复处理的最终业务结果保持不变。
+阅读 [VoucherOrderServiceImpl.java](../../src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java) 的“生成 ID → 执行 Lua → 发送消息 → 返回 ID”。
 
-这里的幂等键是 `(user_id, voucher_id)`，而不是 `orderId`。同一个用户对同一张券只能有一个订单；不同 orderId 的重复业务消息也必须被拦住。
+问题：为什么消息使用同一个 orderId？
 
-### 3. 事务与唯一键异常的顺序
+答案：接口返回值、日志和消费者写库使用同一标识，方便查询和排查。幂等键不是 orderId，而是 (userId, voucherId)，因为重复投递可能带来不同 orderId。
 
-订单事务内的顺序是：查重 → 条件扣库存 → 插入订单。两个重复消息并发时，可能都在查重时看不到订单，随后都尝试扣库存和插入。
+### 5. 读 RabbitMQ 配置：持久性和边界
 
-数据库 UNIQUE 只允许其中一个 INSERT 成功。失败的一方必须让 `DuplicateKeyException` 离开 `@Transactional` 方法，这样本次事务会回滚，前面的库存 UPDATE 一起回滚。外层再查询同一业务键，确认订单确实已存在后，才能把这条重复消息视为成功处理。
+阅读 [SeckillRabbitConfig.java](../../src/main/java/com/hmdp/config/SeckillRabbitConfig.java) 与 [application.yaml](../../src/main/resources/application.yaml)。
 
-错误写法是：在事务内部 catch 唯一键异常后直接 return。这样事务可能正常提交，已经执行的库存 UPDATE 会留下，导致重复消息多扣库存。
+问题：durable 和 persistent 有什么用？
 
-### 4. 条件更新防超卖
+答案：durable 让交换机、队列、绑定在 broker 重启后仍存在；persistent 让消息按持久消息发送。它们不能证明生产者已到达 broker，因此没有 Confirm 就不能承诺绝不丢消息。地址、账号、密码从 spring.rabbitmq.* 和环境变量读取，连接失败会暴露异常而不是静默成功。
 
-库存操作不是“先 SELECT 库存，再在 Java if 判断后 UPDATE”，因为读与写之间可能有别的事务修改库存。本项目使用等价 SQL：
+### 6. 读 Listener：AUTO ACK 的时机
 
-```sql
+阅读 [VoucherOrderListener.java](../../src/main/java/com/hmdp/listener/VoucherOrderListener.java)。
+MQ 消费优惠券下单消息，先用 Redisson 用户级分布式锁防并发；调用事务方法扣库存建订单；捕获数据库唯一冲突异常，**二次查询区分是【用户重复下单】还是【其他主键冲突】**，只对用户重复下单做幂等放行，其余异常抛出交给 MQ 重试。
+
+问题：AUTO ACK 是收到消息立刻确认吗？
+
+答案：不是。Listener 正常返回，Spring 才视为成功；Service 抛出的异常必须继续向外传播。若 Listener catch 后只打印日志并正常返回，框架会错误 ACK，消息就丢了。
+
+Listener 只做日志和委托，数据库业务留在 Service，避免复制业务规则，也让事务边界清晰。
+
+### 7. 读 Retry 和错误队列
+
+在 [application.yaml](../../src/main/resources/application.yaml) 找 retry，在配置类找 RepublishMessageRecoverer。
+
+问题：max-attempts: 3 是几次？
+
+答案：总共三次：首次、等待约 1 秒后的第二次、等待约 2 秒后的第三次。当前事务是在每次业务调用内部开启的，所以一次失败先回滚，下一次 retry 再开启新事务，stateless retry 更符合这个边界。
+
+问题：为什么不无限 requeue？
+
+答案：毒消息或持续故障会反复占用业务队列。三次耗尽后转发到持久错误队列，并保留原 JSON、异常头、原交换机和路由键，供人工排查；它不是自动重放。
+
+### 8. 读订单事务：重复消息为什么不重复扣库存
+
+阅读 [VoucherOrderPersistenceService.java](../../src/main/java/com/hmdp/service/impl/VoucherOrderPersistenceService.java)。
+
+关键顺序是：查重 → 条件扣库存 → 插入订单。
+
+问题：为什么必须条件更新？
+
+答案：不能“SELECT 库存 → Java 判断 → 普通 UPDATE”，因为读写之间可能被其他事务抢走最后一件。代码使用等价 SQL：
+
+~~~sql
 UPDATE tb_seckill_voucher
 SET stock = stock - 1
 WHERE voucher_id = ? AND stock > 0;
-```
+~~~
 
-返回更新行数为 0 就说明数据库库存已不足，事务抛异常而不是创建订单。这是数据库侧的最终防超卖控制。
+更新 0 行就抛库存不足异常。
+豆包：先查询库存再扣减是两条 SQL，存在竞态条件会超卖；条件更新把判断和扣减合并成一条原子 SQL，借助 InnoDB 行锁，保证不会超卖。乐观锁。
 
-### 5. retry、requeue、错误队列不是同一件事
+问题：两个重复消息同时消费会怎样？
 
-本地 retry 是消费者线程在当前消息处理过程中再次调用业务代码。本项目总共尝试三次：首次、等待 1 秒后的第二次、等待 2 秒后的第三次。每一次都是新数据库事务，因为事务在 retry 回调内部。
+答案：两者都可能先查不到订单，但只有一个 INSERT 能通过 (user_id, voucher_id) UNIQUE。失败方的 DuplicateKeyException 必须离开 @Transactional 方法，库存更新和插入一起回滚；事务外 Service 再确认业务订单已存在，把它作为幂等成功。不能在事务内部 catch 后直接 return，否则可能提交第二次库存扣减。
 
-requeue 是把消息重新放回 broker 业务队列。无限 requeue 会让持续失败消息反复占用消费者，因此配置了 `default-requeue-rejected: false`。
+### 9. 读数据库约束：Redis 不是最终防线
 
-错误队列是三次耗尽后由 `RepublishMessageRecoverer` 主动转发的持久消息。它保留原 JSON 和 `x-exception-*`、原交换机、原路由键，方便在控制台人工核对。它不是自动重放机制，也不是 broker DLX。
+阅读 [hmdp.sql](../../src/main/resources/db/hmdp.sql) 和 [20260909_voucher_order_unique.sql](../../src/main/resources/db/migration/20260909_voucher_order_unique.sql)。
 
-## 高频问题与可直接练习的成段回答
+问题：Redis 已经一人一单，为什么还要 UNIQUE？
 
-### 为什么从 Redis Stream 换成 RabbitMQ？
+答案：Redis 是前置快速拦截，可能被重复 MQ、其他写入入口或异常流程绕过；MySQL (user_id, voucher_id) 唯一索引是最终事实约束，不依赖某个应用实例是否拿到锁。
 
-“原实现把秒杀订单写入 Redis Stream，并在业务 Service 内维护消费组、后台线程、ACK 和 pending-list 恢复。当前改造使用 RabbitMQ 的交换机、队列和 Spring Listener 承担消息路由与消费者生命周期，业务 Service 只保留订单业务。选择并不是因为 Redis Stream 一定性能更差，而是项目希望将订单异步消费、失败重试和错误消息观察放到专门的消息模型里。Redis 仍用于 Lua 原子资格校验和库存预扣。两者职责分开后，消费端的可靠性策略更清晰。”
+### 10. 最后读测试：用证据证明设计
 
-### AUTO ACK 怎样保证不会在数据库提交前确认？
+阅读 [SeckillConsumerReliabilityTest.java](../../src/test/java/com/hmdp/SeckillConsumerReliabilityTest.java)。
 
-“这里采用 Spring AMQP 的 AUTO ACK，不是 no-ack。Listener 只委托 Service，业务异常不 catch 吞掉。事务方法在独立 Bean 上，提交成功后方法才会正常返回；如果扣库存、插单或提交失败，异常会传回 Listener，框架不会把这次调用当作成功。对于重试耗尽的消息，Recoverer 转发到错误队列正常返回后，原消息才被 ACK。MySQL 与 RabbitMQ ACK 不是一个分布式事务，所以提交后 ACK 丢失仍可能造成重投，这正是数据库幂等约束存在的原因。”
+问题：怎么证明幂等而不是只相信代码？
 
-### 为什么重试选 stateless，而不是 stateful？
+答案：重复投递和并发投递都要同时断言“订单只有一条、库存只减一次”；还要测试临时异常重试、连续失败进入错误队列、消费者重启后 durable 队列保留消息。项目已用 RabbitMQ、Redis、MySQL 集成测试覆盖这些场景，验收结果为 23 个测试通过。
 
-“不能只因为有数据库事务就选择 stateful，要看事务和 retry 的嵌套关系。本项目没有 Listener 外层事务和 `channelTransacted`，`@Transactional` 在每次业务调用内部开启。一次失败先完整回滚，retry 再发起下一次新的业务调用和新事务，所以 stateless 更符合当前模型，也更容易分析。当前 Spring AMQP 2.2.18 的文档也说明：事务在 retry callback 内部开启时适合 stateless；若有必须跨消息重投维持的外层事务，才需要 stateful。”
+## 面试高频问题：成段回答
 
-### 重复消息为什么不会重复扣库存？
+**为什么从 Redis Stream 换成 RabbitMQ？**
 
-“有三层保护。第一层 Lua 在入口用 Set 快速拦截同一用户重复请求。第二层业务事务开始时查 MySQL 是否已有该用户和券的订单，已存在就直接返回。第三层也是最终保障，数据库有 `(user_id, voucher_id)` UNIQUE。若两条消息同时查重未命中，只有一个 INSERT 能成功；失败方的唯一键异常会触发整个事务回滚，所以它此前执行的条件扣库存也会回滚。事务外确认相同业务订单已经存在后，这条消息作为幂等成功结束。真实并发测试模拟了 Redis 锁不互斥，并确认只生成一个订单、库存只减一次。”
+“Redis Stream 也能做消息队列，但是要自己写很多逻辑：维护消费组、手动处理 ACK、处理 pending 未确认消息。
+换成 RabbitMQ 之后，重试机制、死信 / 错误队列、消息 ACK、消费者管理中间件都帮我们实现好了，我们业务代码只关心下单逻辑，开发维护会简单很多。Redis 还保留，继续做 Lua 脚本的资格校验。不是说 Redis Stream 性能不行，是为了简化消息可靠性这块的开发。
+**如何保证消费端可靠？**
 
-### 为什么不能在事务内部捕获 DuplicateKeyException 后直接返回成功？
+：我们是做到至少一次消费，做不到严格的恰好一次。
+逻辑是：监听器业务异常直接往外抛，不吞异常，失败触发本地重试，最多重试 3 次。重试失败转发错误队列。数据库靠事务 + 唯一索引保证幂等，就算消息重复投递，业务结果不会出错。
+但是我们生产者这边没有开启 Publisher‑Confirm 确认机制，存在一小段不确定性窗口，有可能消息发送的时候 broker 宕机，生产者不知道消息有没有到达 MQ，所以不能保证完全不丢消息。
+**为什么重复消息不会重复扣库存？**
 
-“因为插订单之前已经执行库存 UPDATE。若事务内部 catch 后正常 return，Spring 可能把事务当作成功并提交，第二条重复消息虽然没有插入订单，却留下了一次库存扣减。正确处理是让异常先穿过事务代理触发回滚；外层没有同一个数据库事务，再查询同一个 userId/voucherId 的订单是否已经存在。只有业务键确实存在，才能把重复消费当作成功；如果是无关主键冲突，还要继续抛异常进入重试或错误队列。”
+“Redis Set 是第一层快速拦截，MySQL (user_id, voucher_id) UNIQUE 是最终约束。并发消息即使同时查重未命中，唯一键失败的一方也必须让异常穿过事务代理，回滚前面的条件扣库存；事务外确认订单已存在后才把重复消息视为成功。”
 
-### 为什么需要错误队列，失败时直接丢弃不行吗？
+**为什么使用 stateless retry？**
 
-“短暂数据库抖动可以通过有限次数本地重试恢复，但持续失败需要保留现场。直接丢弃会让订单消息和异常原因都无法排查；无限 requeue 又会让毒消息反复占用消费者。这里三次尝试耗尽后，Recoverer 将原 JSON、异常信息、原 exchange 和 routing key 转发到持久错误队列。运维或开发可以在控制台看到消息，再核对 MySQL 是否已产生订单并决定如何处理。当前没有自动回放，避免在不了解失败原因时盲目重放。”
+“当前没有 Listener 外层事务，@Transactional 在每次业务调用内部开启。失败的一次调用完整回滚，retry 再调用一次并开启新事务，因此 stateless 与现有事务边界一致。不能机械地认为‘有事务就用 stateful’。”
+是否选用 stateful，判断依据不是有没有事务，而是重试是否由外部重新投递触发、需要跨线程 / 跨方法调用延续重试计数。
+如果重试是在同一个线程内循环执行，每次重试都是独立事务，失败完整回滚，事务边界和 stateless 重试边界一致，就应该使用 stateless retry。
+补充一个坑点
+如果这个场景强行改成 stateful=true：
+stateful 会用业务对象作为 key 缓存 RetryContext。但你的重试本就在单线程内循环，不需要缓存；还会引入额外缓存清理问题，甚至内存泄漏。
 
-### durable 与 persistent 是否保证绝不丢消息？
+**为什么需要错误队列？**
 
-“不能。durable 让交换机和队列在 broker 重启后保持定义，persistent 让 broker 已接收的消息按持久消息处理。它们不能覆盖生产者发送到 broker 前的失败，也不能覆盖没有 Confirm 时的不确定结果。本项目还存在 Redis 预扣成功但 MQ 未成功的窗口，以及错误转发没有 Confirm 的窗口。因此当前能说明消费端有有限重试、错误消息保留和数据库幂等，不能声称端到端绝不丢失或 exactly-once。”
+答：短暂的临时异常可以靠重试解决。如果是毒消息，比如消息数据本身非法，怎么处理都失败，就不能无限重试。
+把消息转到错误队列，消息体、异常信息都保留下来，方便我们排查问题。我们项目这里不会自动重新消费错误队列，需要人工看情况处理，防止盲目执行业务逻辑。
 
-### 错误队列和 DLQ 有什么区别？
+**Redis 扣成功了，但 MQ 发送失败怎么办？**
 
-“DLQ 一般是 broker 根据死信规则自动把被拒绝、过期或满队列消息转发到死信交换机。本项目没有配置 broker DLX，而是在本地 retry 用尽后，由 `RepublishMessageRecoverer` 主动发送到错误交换机。它的优势是能添加异常栈、原 exchange 和路由键等应用上下文。两者都能形成失败消息的停放处，但触发方和附带的信息不同。”
+我当前项目主要落地了 Redis Lua 预扣、RabbitMQ 异步下单和消费端幂等，生产者这一侧目前没有完整实现 Confirm 和自动补偿，所以这确实是当前方案的一个一致性缺口。
 
-## 面试追问时的答题框架
+如果按生产级方案完善，我会采用最终一致性：Lua 预扣时记录一条带 orderId 的 pending 状态，MQ 开启异步 Publisher Confirm 和 Return。对于能够明确判断发送失败的情况，通过幂等 Lua 恢复库存和用户购买资格；但对于发送结果未知或者 Lua 成功后应用直接宕机这种窗口，不能贸然补偿，而是由定时对账任务检查数据库订单和 pending 状态，再决定重发还是补偿。
 
-面对“你怎么保证可靠性”这种宽泛问题，不要直接说“保证不丢”。用四步回答：
+所以这里不需要为了强一致直接上 Seata，而是接受短暂不一致，通过补偿和对账最终收敛。
 
-1. 先说明目标和边界：消费端按至少一次处理，目标是重复不产生重复业务效果。
-2. 说明正常路径：AUTO ACK 在事务成功返回后发生，库存和订单同一事务。
-3. 说明失败路径：三次 stateless retry；耗尽转发错误队列；不无限 requeue。
-4. 说明未解决风险：没有 Confirm/Return，Redis 与 MQ 不是原子操作，错误转发也不是原子可靠；因此不承诺 exactly-once。
+**Redis 和 MySQL 库存不一致怎么办？**
 
-这种回答比罗列“Redis、RabbitMQ、MySQL、Redisson”更能显示你理解了因果关系。
+答：
+Redis 是秒杀入口的预扣库存，MySQL 是最终业务库存，所以消费积压期间两者短暂不一致本身是允许的。真正需要处理的是消息丢失或者消费永久失败造成的长期不一致。生产方案里普通明确失败立即补偿，极端窗口由 pending 状态和定时对账处理；对账也不能简单比较两个库存数字，因为队列里可能还有尚未消费的订单，要结合订单状态判断。
 
-## 动手练习与自检
+**那为什么你自己没做？**
 
-### 练习 1：跟踪一次正常订单
+这个问题反而很好回答：
+这个项目我目前优先保证了高并发主链路和消费端幂等。生产者端如果完整实现最终一致性，不能只加一个 Confirm 回调，还需要 pending 状态、幂等补偿以及对账，否则反而可能出现误补偿和库存多加。所以目前把它作为明确的架构改进点，没有为了简历展示去做一个不完整的伪可靠方案。
+## 初学者练习与自检
 
-在专用 RabbitMQ virtual-host 中执行 README 的集成测试命令。阅读 `normalMessageAndSequentialRedeliveryOnlyDeductOnce`，然后回答：第一次和第二次消息各走到哪个 Service 分支？为什么库存从 5 只变成 4？
+1. 画出 Listener → VoucherOrderServiceImpl → VoucherOrderPersistenceService，标出事务代理在哪一层。
+2. 将不存在优惠券的消息发入业务队列，观察三次尝试后的错误队列和 x-exception-* 头。
+3. 解释为什么 Redis 锁失效时，数据库 UNIQUE 仍能保证一单一扣。
 
-### 练习 2：观察错误消息
+考前确认自己能说清：orderId 返回、broker 接收、MySQL 提交的区别；AUTO ACK、retry、requeue、错误队列的区别；唯一键冲突为何必须先回滚；未开启 Confirm 后还剩哪些风险。
 
-执行 `exhaustedRetriesRepublishPersistentMessageWithFailureContext`，在错误队列观察 `delivery_mode=2`、`x-exception-message`、`x-original-exchange` 和原 JSON。不要对验收样例直接重放；先判断它是否已经有订单、失败原因是否已修复。
 
-### 练习 3：证明不是只靠 Redis 锁
+AUTO ACK 是 Broker 自动删消息，宕机丢消息；requeue 是放回原队列立刻重投，无计数易死循环；DLX retry 走死信拓扑延迟可控重试；DLQ 存放重试耗尽的消息，人工处理。
+唯一键冲突抛出异常时事务已经失效，存在部分执行 SQL，必须回滚释放资源；且该异常为重试无效的业务异常，不适合 requeue。
+未开启 Publisher Confirm：网络中断消息状态未知、Broker 宕机内存消息丢失、消息路由失败生产者无感知，无法确认消息是否成功抵达 Broker。
+## 延伸阅读
 
-阅读 `databaseUniqueRaceRollsBackLoserEvenWithoutRedisLock`。该测试故意让锁失去互斥，并用屏障让两个事务同时查重。你应该能解释为什么真实 UNIQUE 冲突是必要断言，以及为什么只断言“最终一单”还不够。
+- [RabbitMQ 拓扑与错误转发](../../src/main/java/com/hmdp/config/SeckillRabbitConfig.java)
+- [订单事务](../../src/main/java/com/hmdp/service/impl/VoucherOrderPersistenceService.java)
+- [事务外幂等判断](../../src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java)
+- [可靠性验收记录](../任务总结/seckill-consumer-reliability.md)
+- [Spring AMQP 2.2 重试说明](https://docs.spring.io/spring-amqp/docs/2.2.6.RELEASE/reference/html/)
 
-### 考前自检
-
-- 我能区分接口返回 orderId、broker 收到消息、MySQL 提交三个不同时间点。
-- 我能解释 AUTO ACK、retry、requeue、错误队列的区别。
-- 我能说明 UNIQUE 冲突必须先回滚再去重。
-- 我知道本项目为什么使用 stateless retry，而不是机械地说“有事务就 stateful”。
-- 我能诚实说出未开 Confirm/Return 后仍有的风险。
-
-## 可引用的代码与验收证据
-
-- [消费可靠性设计与实际验收](../任务总结/seckill-consumer-reliability.md)：23 个筛选测试、进程重启和控制台验证。
-- [测试类](../src/test/java/com/hmdp/SeckillConsumerReliabilityTest.java)：正常、重复、并发、重试、错误队列、连接重建六类场景。
-- [错误队列配置](../src/main/java/com/hmdp/config/SeckillRabbitConfig.java)：持久拓扑和 `RepublishMessageRecoverer`。
-- [订单事务](../src/main/java/com/hmdp/service/impl/VoucherOrderPersistenceService.java)：查重、条件扣库存、插单。
-- [事务外幂等判断](../src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java)：只对确认的业务重复消息返回成功。
-- [Spring AMQP 2.2 重试与事务说明](https://docs.spring.io/spring-amqp/docs/2.2.6.RELEASE/reference/html/)：当前依赖版本对应的官方说明。
-
-面试时不要把测试结果说成性能数据。本项目实际验证了功能正确性和失败路径；没有做吞吐、延迟或 broker 宿主机断电恢复压测。
+测试通过代表功能和失败路径已验证，不代表做过吞吐、延迟或 broker 断电恢复压测。

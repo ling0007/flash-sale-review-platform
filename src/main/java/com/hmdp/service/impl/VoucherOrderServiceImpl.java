@@ -63,23 +63,30 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Override
     public void createVoucherOrder(VoucherOrderMessage message) {
+        // 1. 参数校验
         if (message == null || message.getOrderId() == null || message.getUserId() == null
                 || message.getVoucherId() == null) {
             throw new IllegalArgumentException("Incomplete voucher order message");
         }
+        // 2. 获取Redisson分布式锁：锁粒度是【用户id】，同一个用户抢同一把锁
         RLock lock = redissonClient.getLock("lock:order:" + message.getUserId());
         if (!lock.tryLock()) {
             throw new IllegalStateException("Order lock unavailable for user: " + message.getUserId());
         }
+        // 构建订单对象
         try {
             VoucherOrder order = new VoucherOrder().setId(message.getOrderId())
                     .setUserId(message.getUserId()).setVoucherId(message.getVoucherId());
-            try {
-                // 跨 Bean 调用事务代理：提交/回滚结束后才返回，外层没有数据库事务。
+            try {// 3. 调用带事务的Service，插入订单 + 扣库存
+                // 注释重点：persistenceService是Spring事务代理对象，方法内部开启事务
+                // 事务在persistenceService方法内部提交/回滚；外层当前方法**没有数据库事务**
+
                 persistenceService.createVoucherOrder(order);
             } catch (DuplicateKeyException duplicate) {
-                // 异常已穿过事务边界，此次库存扣减已经回滚；再用新查询核实业务唯一键。
-                // 不能把任意主键碰撞都当作已处理，否则 orderId 冲突等真实错误会被误 ACK。
+                // 4. 捕获数据库唯一索引冲突异常（唯一键：userId + voucherId，限制一人一单）
+                // 说明：内部事务已经因为唯一键冲突回滚，库存扣减也回滚了
+                // ⚠️ 这里不能直接捕获异常就认为是重复下单，必须二次查询校验
+                // 查询发现：数据库里并没有该用户+券的订单，说明不是一人一单冲突，是别的唯一键冲突（比如orderId主键冲突），需要向上抛出异常。
                 if (!persistenceService.orderExists(message.getUserId(), message.getVoucherId())) {
                     throw duplicate;
                 }
@@ -89,5 +96,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         } finally {
             lock.unlock();
         }
+        //MQ 消费优惠券下单消息，先用 Redisson 用户级分布式锁防并发；调用事务方法扣库存建订单；捕获数据库唯一冲突异常，**二次查询区分是【用户重复下单】还是【其他主键冲突】**，只对用户重复下单做幂等放行，其余异常抛出交给 MQ 重试。
     }
 }
