@@ -10,6 +10,8 @@ import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.UserMapper;
+import com.hmdp.ratelimit.exception.RateLimitExceededException;
+import com.hmdp.ratelimit.exception.RateLimitInfrastructureException;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.RegexUtils;
 import com.hmdp.utils.UserHolder;
@@ -47,20 +49,55 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
 
     @Override
     public Result sendCode(String phone, HttpSession session) {
-        // 1.校验手机号
+        // 1. 必须先校验手机号。非法手机号直接返回，不能创建 cooldown key 污染 Redis。
         if (RegexUtils.isPhoneInvalid(phone)) {
-            // 2.如果不符合，返回错误信息
             return Result.fail("手机号格式错误！");
         }
-        // 3.符合，生成验证码
+
+        String cooldownKey = LOGIN_CODE_COOLDOWN_KEY + phone;
+        final Boolean cooldownAcquired;
+        try {
+            /*
+             * 2. SET key value NX EX 60 的 Spring Data Redis 写法：
+             * - setIfAbsent 对应 NX：只有 key 不存在时才写入；
+             * - 60 + SECONDS 对应 EX 60：Redis 自动在 60 秒后删除 key；
+             * - 判断和设置过期时间由一次 Redis 命令原子完成，不存在先查后写的并发窗口。
+             */
+            cooldownAcquired = stringRedisTemplate.opsForValue().setIfAbsent(
+                    cooldownKey, "1", LOGIN_CODE_COOLDOWN_SECONDS, TimeUnit.SECONDS);
+        } catch (RuntimeException redisFailure) {
+            // 无法确认手机号是否仍在冷却期时按约束 fail-closed，不能绕过限流继续发送。
+            throw new RateLimitInfrastructureException(
+                    "Verification code cooldown could not access Redis", redisFailure);
+        }
+
+        if (cooldownAcquired == null) {
+            // Spring Data Redis 正常应返回 true/false；null 表示结果不可判定，按基础设施异常处理。
+            throw new RateLimitInfrastructureException("Verification code cooldown returned no result");
+        }
+        if (!cooldownAcquired) {
+            // 这是正常超限，不是系统错误；Phase 7 的异常处理会返回 HTTP 429，且不打印 ERROR 堆栈。
+            throw new RateLimitExceededException("Verification code can only be sent once every 60 seconds");
+        }
+
+        // 3. 只有成功取得冷却资格后才生成验证码，避免被拒绝的请求做无意义工作。
         String code = RandomUtil.randomNumbers(6);
 
-        // 4.保存验证码到 session
-        stringRedisTemplate.opsForValue().set(LOGIN_CODE_KEY + phone, code, LOGIN_CODE_TTL, TimeUnit.MINUTES);
+        try {
+            // 4. 验证码本身仍保存 2 分钟；它与 60 秒 cooldown 是两个 key、两个独立生命周期。
+            stringRedisTemplate.opsForValue().set(
+                    LOGIN_CODE_KEY + phone, code, LOGIN_CODE_TTL, TimeUnit.MINUTES);
+        } catch (RuntimeException redisFailure) {
+            /*
+             * cooldown 已成功写入但验证码保存失败时，不做删除补偿：删除与故障期间的重试仍可能失败，
+             * 而且可能重新打开高频发送窗口。保留最多 60 秒的冷却是保守的 fail-closed 取舍。
+             */
+            throw new RateLimitInfrastructureException(
+                    "Verification code could not be stored in Redis", redisFailure);
+        }
 
-        // 5.发送验证码
+        // 5. 最后才模拟/真实发送。至此执行顺序严格是：格式校验 → NX EX 60 → 生成 → 保存 → 发送。
         log.debug("发送短信验证码成功，验证码：{}", code);
-        // 返回ok
         return Result.ok();
     }
 

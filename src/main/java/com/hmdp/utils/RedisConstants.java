@@ -3,6 +3,10 @@ package com.hmdp.utils;
 public class RedisConstants {
     public static final String LOGIN_CODE_KEY = "login:code:";
     public static final Long LOGIN_CODE_TTL = 2L;
+    /** 验证码发送冷却 key 与验证码内容分开，避免两种不同生命周期互相覆盖。 */
+    public static final String LOGIN_CODE_COOLDOWN_KEY = "login:code:cooldown:";
+    /** 同一手机号成功取得发送资格后，60 秒内不能再次取得。单位是秒。 */
+    public static final Long LOGIN_CODE_COOLDOWN_SECONDS = 60L;
     public static final String LOGIN_USER_KEY = "login:token:";
     public static final Long LOGIN_USER_TTL = 36000L;
 

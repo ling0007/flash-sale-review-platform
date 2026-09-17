@@ -53,6 +53,15 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+        <!--
+            Spring AOP starter 会引入 Spring AOP 与 AspectJ Weaver。
+            本项目使用的是“Spring 代理式 AOP”：运行时由代理对象在 Controller 方法前后插入限流逻辑，
+            并不是修改 Controller 源码，也不是使用完整的编译期 AspectJ 织入。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>mysql</groupId>
