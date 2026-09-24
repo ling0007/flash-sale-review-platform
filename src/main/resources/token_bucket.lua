@@ -28,10 +28,10 @@ local capacityMilli = capacity * tokenScale
 local redisTime = redis.call('TIME')
 local nowMillis = tonumber(redisTime[1]) * 1000 + math.floor(tonumber(redisTime[2]) / 1000)
 
-local storedTokensRaw = redis.call('HGET', key, 'tokens_milli')
-local lastRefillRaw = redis.call('HGET', key, 'last_refill_ms')
-local tokensMilli
-local lastRefillMillis
+local storedTokensRaw = redis.call('HGET', key, 'tokens_milli') --剩余 milli-token
+local lastRefillRaw = redis.call('HGET', key, 'last_refill_ms') --上次计算补充后的 Redis 毫秒时间戳
+local tokensMilli --现在的 milli-token 余额
+local lastRefillMillis --上次计算补充后的 Redis 毫秒时间戳
 
 if not storedTokensRaw and not lastRefillRaw then
     -- 新桶从满桶开始，所以第一次突发最多可以连续放行 capacity 个请求。
@@ -61,7 +61,7 @@ local elapsedMillis = nowMillis - lastRefillMillis
 
 -- 1 token = 1000 milli-token；refillRate 的单位是 token/秒。
 -- 因此经过 elapsedMillis 后应补充：
--- elapsedMillis / 1000 * refillRatePerSecond * 1000
+-- (elapsedMillis / 1000) * refillRatePerSecond * 1000
 -- = elapsedMillis * refillRatePerSecond 个 milli-token。
 --
 -- 当 elapsed 已足以从空桶补满时直接设为 capacity，既表达“长时间空闲后满桶”，
@@ -81,6 +81,7 @@ if tokensMilli >= tokenScale then
 end
 
 -- 即使本次拒绝，也要保存不足一个完整令牌的余额和当前时间。
+--数学上纯拒绝场景结果近似等价，但工程上**必须每次推进状态**，否则时间戳陈旧 + key 可能丢失，最终会破坏限流准确性。
 -- 使用 milli-token 后，频繁请求不会反复丢掉这部分小数补充值。
 redis.call('HSET', key,
         'tokens_milli', tokensMilli,

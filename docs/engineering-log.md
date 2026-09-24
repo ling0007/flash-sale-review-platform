@@ -369,3 +369,337 @@
 4. 多个 `@ExceptionHandler` 如何选择？Spring 按异常类型匹配更具体的处理方法，限流专用异常不会落入通用 RuntimeException handler。
 5. 为什么响应不直接返回异常 message？内部 message 可能包含资源名、Redis key 或连接信息，应返回稳定、安全的客户端文案。
 6. fail-closed 与 503 的关系是什么？依赖异常时不放行业务，并用 503 明确告诉调用方这是基础设施不可用而非正常超限。
+
+## [2026-09-17] 接口限流 Phase 8：HTTP 组合验证与压测准备
+
+### 1. 背景 / 问题
+
+- Phase 2~7 已分别验证算法 Lua、并发原子性、key 解析、AOP 顺序、异常映射和验证码冷却，但此前 AOP 测试与 MockMvc 异常测试是分开的，缺少一次请求跨越 RefreshToken/Login 拦截器、MVC、AOP、Advice 和 Controller 的组合证据。
+- GLOBAL/USER 参数仍是设计初值。压测会让 HTTP 200 请求继续进入真实订单 ID、`seckill.lua`、RabbitMQ 和数据库链路，不能在未准备隔离数据时直接执行。
+
+### 2. 方案选择
+
+- 不重复执行已经通过且代码未变化的 10 个真实 Redis 算法测试、43 个筛选回归和 4 个验证码 Redis 测试，只新增最小的 Web/AOP 组合测试。
+- 使用 MockMvc 调用带 Aspect 的 Controller 代理，按生产顺序挂载真实 `RefreshTokenInterceptor`、`LoginInterceptor` 和 `WebExceptionAdvice`；登录 Redis、算法执行器和订单 Service 使用 mock，从而验证组合边界但不连接 Redis、MQ、MySQL。
+- 压测准备选择独立 k6 脚本，提供 USER constant-vus 与 GLOBAL constant-arrival-rate 两种模式。脚本只采集 200/429/503，不内置未经实测的性能通过阈值。
+
+### 3. 核心实现
+
+- 新增 `SeckillRateLimitHttpIntegrationTest` 四个用例：USER 拒绝跨层返回 429 且 Service 零调用；基础设施异常返回 503 且 Service 零调用；两级规则通过后返回原业务结果；无 token 时由登录拦截器返回 401，且限流器和 Service 都不调用。
+- 新增 `scripts/load-test/seckill-rate-limit.js`，通过环境变量配置模式、URL、voucherId、token、到达率、VU 和持续时间，并分别统计 allowed、limited、unavailable 与 unexpected 响应。
+- 新增压测 README，明确隔离环境、专用券/账号、Redis 7.2、分级升压、清理策略和全链路观测项。GLOBAL 场景要求足够多的独立 token，减少 USER 规则对结果解释的干扰。
+- Phase 8 不新增 Redis 数据结构，也不修改两份 Lua：线上仍由 Sliding Window Hash 保存 `previous_count/current_count/current_window_start_ms`，Token Bucket Hash 保存 `tokens_milli/last_refill_ms`；Lua 的时间、加权/补充、判断、写回与 TTL 步骤仍由 Phase 2/3 测试负责。
+- 新增组合测试实测 4 tests、0 failures、0 errors。当前环境未安装 k6，因此只完成脚本和执行清单，没有实际发压，也没有调整 1500/1000、5/1000ms 等参数。
+
+### 4. 遇到的坑
+
+- 本阶段新增组合测试及真实拦截器链增强均通过，没有发生需要记录的功能问题。测试 503 路径输出完整 ERROR 堆栈符合 Phase 7 的日志设计，不是测试失败。
+- 检查压测工具时发现当前机器未安装 k6，因此没有伪造脚本执行结果；脚本需要在准备好隔离环境与 k6 后按 README 执行。
+
+### 5. 为什么这样改
+
+- 分层测试回答“各部件是否正确”，组合测试回答“部件连接后是否仍保持 HTTP 语义”；只保留四个跨层用例，避免把算法公式和并发测试在更慢的 Web 测试中再复制一遍。
+- 没有选择完整 `@SpringBootTest` 连接 Redis、RabbitMQ 和 MySQL：那会重复算法与基础设施测试、扩大副作用，并让失败原因难定位；MockMvc 组合测试保留了本阶段真正关心的拦截器顺序、代理调用和 HTTP 映射。
+- 压测脚本不设置主观 P95/QPS 门槛。合理阈值需要结合应用线程池、Redis、RabbitMQ、消费者和 MySQL 的同步观测，而不是先写一个必过数字。
+- 没有在当前环境直接压测，因为放行请求会产生真实业务副作用。准备可重复脚本与安全清单比对未知环境盲目发压更符合工程边界。
+
+### 6. 面试复盘
+
+1. 单元、集成和压测分别回答什么？单元验证局部逻辑，组合集成验证层间契约，压测验证容量、延迟和拐点。
+2. 为什么组合测试 mock Redis 算法？Lua 与真实 Redis 已单独验证；这里关注 MVC/AOP/Advice 连接，避免重复测试和外部依赖干扰。
+3. 为什么验证 Service 零调用？订单 ID、秒杀 Lua 和 MQ 全在 Service 内，零调用直接证明入口拒绝足够早。
+4. 为什么 GLOBAL 场景需要多个 token？token 太少会先频繁命中 USER 规则，429 状态本身无法区分是哪一级拒绝。
+5. 为什么使用 constant-arrival-rate？它控制入口到达速率，更适合观察 Token Bucket 的 refillRate 和 capacity，而不是让 VU 自由跑出不稳定吞吐。
+6. 为什么没有给出最终阈值？尚未执行隔离环境全链路压测，任何生产 QPS 或延迟结论都会是编造。
+
+## [2026-09-17] 接口限流 Phase 9：工程日志与面试材料收敛
+
+### 1. 背景 / 问题
+
+- Phase 2~8 已持续更新日志与面试笔记，如果在最终阶段重新复制全部算法说明，会形成多份容易失真的重复材料。
+- 当前需要把“已完成能力、验证证据、尚未执行事项”收敛到最新状态，使后续复习不会把压测准备误读为已完成容量验证。
+
+### 2. 方案选择
+
+- 保留每个 Phase 的原始六段式工程记录，只新增 Phase 8/9 事实，不覆盖或重写历史决策。
+- `interview-notes.md` 继续承担考前速记：更新当前亮点、测试证据、阅读路径、高频问题和不足，不复制 Lua 的逐步解释。
+- 明确区分“代码功能完成”“自动测试通过”“脚本已准备”“真实压测未执行”四种状态。
+
+### 3. 核心实现
+
+- 将当前限流主线更新为 Phase 2~8：两种 Redis Lua 算法、AOP、秒杀接入、验证码 cooldown、HTTP 429/503、跨层组合测试和压测准备。
+- 增加组合测试与压测方法相关面试题，并把 `SeckillRateLimitHttpIntegrationTest`、k6 脚本及 README 加入推荐阅读路径。
+- 当前不足聚焦仍需完成的事实：未执行真实压测、参数未校准、普通 IP 能力尚未选择接口接入、可信代理解析未配置。
+
+### 4. 遇到的坑
+
+- 本阶段为文档收敛，没有发生新的实现问题。复核时主动避免把此前不同命令的测试数量简单相加成一次“全量测试”，分别保留各阶段真实运行证据。
+
+### 5. 为什么这样改
+
+- 工程日志保留过程证据，面试笔记提炼结论；两者职责不同。只维护一份最终速记可以降低参数、限制和完成状态相互矛盾的风险。
+- 明确未验证项比包装成“高并发优化完成”更可信，也为下一步真实容量测试提供清晰入口。
+
+### 6. 面试复盘
+
+1. 如何证明项目不是只写了限流代码？有算法单元测试、Redis 集成测试、AOP/HTTP 组合测试和可执行压测准备，各层证据职责不同。
+2. 可以说系统支持 1000 QPS 吗？不能；1000 是当前 refillRate 初值，不是压测结论。
+3. 当前主线真正完成到哪里？功能与自动化验证完成到跨层 HTTP，压测脚本已准备但真实容量验证未执行。
+4. 为什么文档也属于工程交付？它记录边界、取舍和验证事实，避免维护者把限流当作库存正确性或误用未校准参数。
+5. 下一步最重要的工作是什么？在隔离环境执行分级压测，观测全链路指标后调整 USER/GLOBAL 参数并记录结果。
+
+## [2026-09-21] SQL 与索引 Phase 1：真实库基线及暂缓建索引
+
+### 1. 背景 / 问题
+
+- 店铺券列表按 `shop_id`、`status` 过滤并左连接秒杀券；热门笔记按 `liked DESC` 分页。两条查询在代码中没有对应的过滤或排序索引，需要先核对真实数据库，而不能依据建表文件推断现网索引与数据量。
+- 本阶段只分析这两条读查询，并核对秒杀一人一单的已有唯一索引；不进行 HTTP 压测或缓存改造。
+
+### 2. 方案选择
+
+- 对本机 `127.0.0.1:3306/hmdp` 的 MySQL 8.0.27 只读查询 `COUNT(*)`、`SHOW INDEX`、数据分布和 `EXPLAIN`。固定券列表 `shopId=1`、热门笔记第一页 `LIMIT 0,10`，保留原 SQL 与计划，供同条件复核。
+- 把 `tb_voucher(shop_id, status)` 和热门笔记的 `liked` 排序索引作为候选评估；真实表目前过小，不为得到“优化”结果而建索引。`tb_voucher_order(user_id, voucher_id)` 已有唯一索引，保持不变。
+
+### 3. 核心实现
+
+- 实测行数：`tb_voucher=1`、`tb_seckill_voucher=0`、`tb_blog=4`、`tb_voucher_order=0`。券表唯一记录为 `shop_id=1,status=1`；笔记 `liked` 分布为 `13:1、11:2、2:1`。`SHOW INDEX` 确认券、秒杀券、笔记均仅有各自主键；订单表有主键及两列顺序为 `user_id,voucher_id` 的 `uk_voucher_order_user_voucher`。券和订单索引显示的 `Cardinality=0` 是当前统计估计，不能解释成字段没有不同值。
+- 优惠券 Mapper 原 SQL（以 `shopId=1` 代入参数）：
+
+```sql
+SELECT v.`id`, v.`shop_id`, v.`title`, v.`sub_title`, v.`rules`, v.`pay_value`,
+       v.`actual_value`, v.`type`, sv.`stock`, sv.begin_time, sv.end_time
+FROM tb_voucher v
+LEFT JOIN tb_seckill_voucher sv ON v.id = sv.voucher_id
+WHERE v.shop_id = 1 AND v.status = 1;
+```
+
+| 优化前表 | type | possible_keys | key | rows | filtered | Extra |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| v | ALL | NULL | NULL | 1 | 100.00 | Using where |
+| sv | eq_ref | PRIMARY | PRIMARY | 1 | 100.00 | NULL |
+
+- 热门笔记首页与 MyBatis-Plus 分页计数的基线 SQL：
+
+```sql
+SELECT id, shop_id, user_id, title, images, content, liked, comments, create_time, update_time
+FROM tb_blog ORDER BY liked DESC LIMIT 0, 10;
+SELECT COUNT(*) AS total FROM tb_blog;
+```
+
+| 优化前查询 | type | possible_keys | key | rows | filtered | Extra |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| 热门笔记分页 | ALL | NULL | NULL | 4 | 100.00 | Using filesort |
+| 分页计数 | index | NULL | PRIMARY | 4 | 100.00 | Using index |
+
+- 本次没有修改 SQL、业务代码或数据库索引，因此不存在“优化后 EXPLAIN”或性能增幅。以上基线是执行计划与数据规模记录，不是接口响应时间或吞吐 benchmark。
+
+### 4. 遇到的坑
+
+- 本机 3306 可连接，但 PATH 中没有 `mysql` 客户端，Docker daemon 也未运行；改用现有 Python `mysql.connector` 执行相同的只读 SQL，成功取得真实库结果。没有因此修改数据库或应用配置。
+
+### 5. 为什么这样改
+
+- `v` 缺少过滤索引而显示 `ALL`，但当前仅 1 行，扫描成本极低；`sv` 通过 `voucher_id` 主键做 `eq_ref` 连接。`(shop_id,status)` 满足 WHERE 最左前缀的候选条件，但只有在代表性数据规模和实际读取压力下减少扫描、且收益覆盖维护成本时才值得新增。
+- 热门笔记的 `Using filesort` 目前只排序 4 行；`liked` 在点赞接口会更新。给它建索引会增加每次点赞更新成本，且宽字段仍需回表，不能仅凭出现 filesort 就认定值得建索引。
+- 一人一单查重同时按 `user_id`、`voucher_id` 等值过滤，已有唯一索引可按列顺序匹配；不增加同列冗余索引。若未来数据增长，应使用相同 SQL、相同数据与环境重新采集 EXPLAIN，再决定是否修改并复测。
+
+### 6. 面试复盘
+
+1. 为什么券列表 `type=ALL` 仍不加索引？真实表只有 1 行；访问类型只是线索，必须结合 `rows`、数据分布及写入代价判断。
+2. `sv` 的 `eq_ref` 说明什么？对 `v.id` 的每一行，通过 `sv.voucher_id` 唯一主键最多匹配一行。
+3. 为什么候选联合索引顺序是 `(shop_id,status)`？查询以店铺为主要过滤维度，两列均等值过滤；`shop_id` 作为前导列还能支持只按店铺查询，但最终仍要看真实选择性与工作负载。
+4. `filtered=100` 是否代表查询很快？不是；它是估计行通过条件的比例，仍需连同扫描行数和执行情况解读。
+5. 为什么热门笔记 `Using filesort` 不立即建索引？当前仅 4 行，排序开销小；`liked` 经常更新，索引有写成本，取完整笔记还可能回表。
+6. `Cardinality=0` 能证明索引无效吗？不能；它是索引统计估计，在空表或极小表上尤其不能代替实际数据分布。
+7. 一人一单为什么不再建 `(voucher_id,user_id)`？当前查重同时给定两列，现有 `(user_id,voucher_id)` 唯一索引已经匹配并承担最终约束；反向索引需要独立的查询证据。
+
+## [2026-09-24] 商铺缓存 Phase 2：冷启动与热缓存性能验证
+
+### 1. 背景 / 问题
+
+- `GET /shop/{id}` 当前通过 `ShopServiceImpl.queryById` 调用 `CacheClient.queryWithPassThrough`。命中 `cache:shop:{id}` 时直接返回 Redis JSON；未命中时通过 MyBatis-Plus `getById` 查询 MySQL，再写入 Redis。
+- 当前实现没有协调同一 key 的并发重建。需要用真实请求区分缓存失效瞬间与热缓存稳态，观察是否出现数据库请求放大，而不是临时关闭缓存制造无缓存对照组。
+
+### 2. 方案选择
+
+- 在既有 `scripts/load-test` 下新增参数化 JMeter 计划，显式传入 `BASE_URL`、`shopId`、`threads`、`rampUp` 和 `duration`；保留原 k6 限流脚本。
+- 本地选择真实存在的 `shopId=1`。应用、JMeter、MySQL 8.0.27、Redis 7.2 位于同一机器；两轮都使用 100 threads、0 秒 ramp-up、15 秒 duration。正式测试前用 `shopId=2` 初始化 DispatcherServlet、Hikari 连接池和相关类，避免把应用首次初始化只计入冷缓存结果。
+- MySQL 使用 `performance_schema.events_statements_summary_by_digest` 前后差值统计 `tb_shop WHERE id = ?`；Redis 使用 `INFO commandstats` 的 GET/SETEX 累计值差值。JMeter 使用非 GUI 模式并生成 JTL 与 HTML 报告。
+
+### 3. 核心实现
+
+- 缓存 key 是 `cache:shop:{shopId}`，正常对象 TTL 为 30 分钟，空值 TTL 为 2 分钟。数据库查询发生在 `queryWithPassThrough` 的 `dbFallback.apply(id)`，正常结果通过 `CacheClient.set` 使用 SETEX 写回；`ShopServiceImpl.update` 在数据库更新后删除同一 key。
+- 测试库 `tb_shop` 实测 14 行，ID 范围 1~14。本次只读取 `shopId=1`，没有修改商铺数据。
+- JMeter HTML 报告结果如下。Throughput 是这一次固定本地负载下的完成速率，不代表已找到系统容量上限。
+
+| 场景 | Threads | Samples | Throughput(/s) | Avg(ms) | P95(ms) | P99(ms) | Error Rate | MySQL 查询增量 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 冷启动/缓存失效瞬间 | 100 | 22,616 | 1,532.87 | 64.92 | 156 | 296 | 0.00% | 12 |
+| 热缓存稳态 | 100 | 37,994 | 2,567.34 | 38.70 | 128 | 161 | 0.00% | 0 |
+
+- 冷启动前 `EXISTS cache:shop:1=0`。该轮 Redis GET 增量 22,616、SETEX 增量 12，和 MySQL 主键查询增量 12 一致，说明多个请求在首个缓存写入完成前同时读到未命中并各自查库、写回。测试结束后 key 已存在，TTL 为 1,779 秒。
+- 冷启动首个 1 秒窗口包含 459 个样本，Avg 245.84ms、P95 499ms、范围 23~546ms；随后第 2 秒 Avg 80.83ms/P95 158ms，第 3 秒 Avg 78.61ms/P95 136ms。这里的逐秒值由 JTL 按请求开始时间分桶，用来描述恢复过程；表格中的 P95/P99 来自 JMeter HTML 全轮统计。
+- 热缓存轮开始前再次预热并确认 key 存在、TTL 为 1,763 秒。该轮 Redis GET 增量 37,994、SETEX 增量 0，MySQL 查询、检查行及返回行增量均为 0，证明稳态请求全部走现有 Redis 读取路径。
+
+### 4. 遇到的坑
+
+- 当前 PATH 没有 `redis-cli`，因此通过项目 Redis 容器内的客户端执行 DEL、EXISTS、TTL 与 INFO，不影响应用使用的同一 Redis 实例。
+- 首次生成指标快照时，Python MySQL 驱动把聚合结果返回为 `Decimal`，直接 JSON 序列化失败；将四个累计字段显式转换为整数后重新采集。失败发生在正式压测前，没有丢失或污染测试窗口。
+- 仓库指定的 RabbitMQ 3.13 镜像当时未完成拉取；本阶段接口不使用 MQ，但应用启动会声明 RabbitMQ 拓扑，因此两轮统一使用本机已有的 RabbitMQ 3.8 临时容器满足启动依赖。该差异不改变商铺 Redis/MySQL 调用链，但结果只代表本次本地环境。
+
+### 5. 为什么这样改
+
+- 实验确认当前 Pass Through 在热缓存下能完全隔离该接口的 MySQL 主键查询，且两轮均无错误；这是对既有缓存价值的验证，不是本阶段新增缓存后的性能提升。
+- 冷启动确有 12 倍数据库查询放大，但只出现在同一 key 的失效窗口；测试库仅 14 行，主键查询很轻，缓存很快恢复。单次本地实验尚未证明该放大会让数据库或接口达到不可接受状态，因此本阶段不修改业务代码。
+- 互斥锁可减少同 key 重建查询，但会让未获得锁的请求等待/重试并增加锁管理；逻辑过期可降低热点 key 过期抖动，但接受短期旧数据且需要预热与异步重建。当前证据不足以承担这些语义和复杂度，保留现有 Cache-Aside / Pass Through。
+- 冷启动与热缓存的总体吞吐和延迟可以用于说明本轮现象，但不能直接当作“缓存带来固定百分比提升”：冷启动轮的大多数请求在 key 建立后也已转为热读，且实验没有构造无缓存版本或寻找系统容量拐点。
+
+### 6. 面试复盘
+
+1. 为什么不能把删除缓存后的整轮称为冷缓存？第一次成功查询就会写回，后续请求已经进入缓存恢复或热缓存状态。
+2. 如何证明发生缓存击穿式放大？缓存失效后同一 SQL 的 MySQL digest 增加 12，Redis SETEX 同样增加 12，而测试对象只有一个 key。
+3. 为什么热缓存轮能证明数据库被隔离？37,994 次请求对应 37,994 次 Redis GET，而 MySQL 查询、检查行和返回行增量均为 0。
+4. 为什么本阶段不立刻加互斥锁？虽然观察到 12 次并发查库，但没有数据库压力异常或错误证据；锁会增加等待、重试及故障边界。
+5. Cache-Aside 更新为何先更新数据库再删缓存？数据库是事实来源，删除缓存让下一次读取重建；仍需认识并发读写窗口可能产生短暂不一致。
+6. 为什么关注 P95/P99 而不只看 Avg？冷启动少量慢请求会被大量恢复后的快请求稀释，尾延迟更能反映失效瞬间的用户体验。
+7. 这次 Throughput 能否写成系统支持 2,567 QPS？不能；它只是单机、固定 100 线程和 15 秒窗口下的完成速率，没有分级升压寻找容量拐点。
+
+## [2026-09-24] 秒杀 Phase 3：限流验证、逐级请求与最终订单对账
+
+### 1. 背景 / 问题
+
+- 当前秒杀入口依次经过登录、GLOBAL/USER 限流、`seckill.lua`、RabbitMQ 和 MySQL。HTTP 返回订单 ID 发生在异步消费之前，需要用实际请求和最终订单对账来验证完整链路。
+- 已有 k6 脚本只按 HTTP 状态计数，无法区分 HTTP 200 中的 Lua 接受与业务失败；仓库尚无 JMeter 秒杀计划和多账号 CSV 方案。
+
+### 2. 方案选择
+
+- 保留正式限流阈值：GLOBAL Token Bucket `capacity=1500/refillRate=1000/s`，USER Sliding Window Counter `limit=5/window=1000ms`。k6 验证限流；JMeter 每账号单请求，逐级使用 10、200、500 线程，单轮请求数低于 GLOBAL 初始桶容量，不覆盖阈值。
+- 使用本地专用券 ID 10、600 个带标记的独立测试账号/token；每轮仅在主队列和错误队列清空后重置该券订单、库存及 Redis 购买资格。环境为本机应用与 JMeter、MySQL 8.0.27、Redis 7.2、RabbitMQ 3.13。测试券和账号只服务于本轮，结果报告保存在 `target/load-test`。
+- RabbitMQ Management API 每 100ms 采样 ready/unacked，并记录 publish/ack 计数；消费结束后核对 Redis 库存、资格 Set、MySQL 库存、订单数、去重用户数和错误队列。
+
+### 3. 核心实现
+
+- 秒杀链路：`POST /voucher-order/seckill/{id}` → `RateLimitAspect` 按 GLOBAL 后 USER 检查 → `VoucherOrderServiceImpl` 生成订单 ID、执行 `seckill.lua` → 发送到 `hmdp.seckill.direct` / `seckill.order.create` / `hmdp.seckill.order.queue` → `VoucherOrderListener` → `VoucherOrderPersistenceService` 事务内查重、条件扣库存、插单。Lua 返回 `0/1/2` 分别表示接受、库存不足、重复购买；Redis 使用 `seckill:stock:{voucherId}` 和 `seckill:order:{voucherId}`。消费者重试耗尽后转发到 `hmdp.seckill.error.queue`；数据库 `(user_id,voucher_id)` 唯一索引兜底。
+- 扩展原 k6 脚本，统计 HTTP 200 的 `accepted_responses` 与 `business_failed_responses`；USER 模式可用 `ITERATIONS` 限制总请求数，保留原持续模式。新增 `seckill-capacity.jmx`、无真实 token 的 CSV 模板、RabbitMQ 观察脚本，并在原压测 README 中写入初始化、运行、对账与清理步骤。JMeter 将 429 视为正常限流，将 503 和连接/其他异常视为错误。
+- USER 正确性：同一账号 10 次请求，HTTP 200 为 5 次（其中 1 次返回订单 ID、4 次一人一单业务失败），HTTP 429 为 5 次，503 为 0；最终 Redis/MySQL 库存均从 5000 降到 4999，订单和购买资格均为 1，主队列清空、错误队列为 0。
+- GLOBAL 观察：k6 恒定到达率目标 2500/s、持续 5s，实际完成 11,491 次、丢弃 1,010 次未发出的迭代。HTTP 429 为 4,927，503 为 0；HTTP 200 为 6,564，其中 600 次返回订单 ID、5,964 次一人一单业务失败。600 个账号被轮换复用，429 混合了 USER/GLOBAL 两种规则，因此本轮**不能单独计算 GLOBAL 拒绝率**。最终 600 单全部落库，两端库存均为 4400，主队列清空，错误队列为 0。
+- JMeter 每线程使用一个独立 CSV token，循环仅一次。`duration=60` 是最大允许时间，各轮在请求完成后提前结束；TPS 是短批次完成速率，不是持续承载能力。
+
+| 阶段 | Threads | Requests | TPS | Avg(ms) | P95(ms) | P99(ms) | 429 | 503 | 业务失败 | Lua 接受 | 最终订单 | 网络/其他错误 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A 链路正确性 | 10 | 10 | 15.04 | 72.20 | 138 | 138 | 0 | 0 | 0 | 10 | 10 | 0 |
+| B 中并发 | 200 | 200 | 352.73 | 165.04 | 314.95 | 333.99 | 0 | 0 | 0 | 200 | 200 | 0 |
+| C 较高并发 | 500 | 500 | 704.23* | 501.60 | 684.95 | 707 | 0 | 0 | 0 | 188 | 188 | 312 次连接拒绝 |
+
+- `*` Stage C 的 704.23/s 包含 312 次未建立 HTTP 连接的失败请求，不能作为业务 TPS；188 次接受请求在该报告中的完成速率为 264.79/s，也不代表稳定容量。错误率为 62.4%。Stage A/B 错误率均为 0。
+- 每轮库存与资格对账：A 初始库存 10，结束 Redis/MySQL 均为 0、资格 Set 10；B 为 200→0、资格 Set 200；C 为 500→312、资格 Set 188。三轮 `COUNT(DISTINCT user_id)` 分别为 10/200/188，重复订单组数均为 0。主队列 publish/ack 各轮增量分别为 10/200/188；最终 ready/unacked 均为 0，错误队列始终为 0。
+- RabbitMQ 100ms 采样在 B/C 的 publish/ack 计数上覆盖了整轮，采样峰值 ready/unacked 均为 0；只能说明采样点未观察到积压，不能排除两次采样之间出现短暂排队。A 的观察器启动时间早于 JMeter 较长的初始化阶段，采样未覆盖该轮发布；A 的最终 publish/ack 增量从两次队列快照核对均为 10。
+- 本轮没有逐档采集 JVM CPU/GC、Tomcat 线程/accept queue、MySQL 活跃连接与慢查询增量、Redis 命令延迟；因此能够对账正确性与定位连接失败阶段，不能完成具体资源瓶颈归因。后续若研究入口边界，应补这些同步指标并使用独立压测机。
+
+### 4. 遇到的坑
+
+- PowerShell 调用 Windows `jmeter.bat` 时，未加引号的 `-JtokenCsv=...csv` 被拆分并报 `Unknown arg: .csv`；将整个 `-JtokenCsv=...` 用双引号包裹后，Stage A/B/C 均正常读取 CSV。
+- Stage A 首次 8 秒 RabbitMQ 观察窗口在 JMeter 完成初始化前结束，未覆盖消息发布。延长观察窗口后仍因启动相位错开无法用采样证明 A 的瞬时峰值，因此保留 publish/ack 前后累计值并如实标记峰值不可得。
+- Stage C 中 312 次请求出现 `HttpHostConnectException: Connection refused`，另外 188 次正常返回订单 ID。应用进程在测试后仍监听 8081，RabbitMQ 188 条消息全部 ACK，MySQL 最终 188 单，Redis/MySQL 库存一致。现有证据只能定位到本机 HTTP 连接建立边界；不能仅凭本次结果认定是 Tomcat backlog、Windows 网络栈或某个依赖的根因。按逐级实验规则停止升压。
+- 清理专用数据时，临时脚本逐个启动 Docker CLI 删除 600 个已过期的 USER 限流 key，执行过慢；核对 SQL 删除和 600 个 token 的批量删除已完成后，停止该脚本。USER 限流 key 的 2 秒 TTL 已到期，扫描为 0；最终复核专用券/订单/用户均为 0，600 个 token 均不存在。临时凭证 CSV 和元数据已删除，只保留脱敏的 JTL/HTML/聚合结果。
+
+### 5. 为什么这样改
+
+- 10 与 200 请求两档证明在该隔离数据和本地负载下，Lua 接受数、MQ publish/ack、Redis 资格与最终订单数一致，且无超卖、重复订单、错误队列消息。500 线程档揭示本机入口连接失败，但已接受的 188 单仍完整落库；这更准确地划定了当前实验边界。
+- 本阶段不修改正式限流、Lua、MQ 或 MySQL 业务代码：没有证据指向 Redis、MQ 消费或数据库瓶颈，也没有足够证据为 HTTP 连接拒绝选择具体代码改法。后续若研究入口连接容量，应独立测量应用线程/accept queue、操作系统连接状态和 JMeter 机器资源，使用更平缓的 ramp-up 与独立压测机复核。
+- 原有生产者发送没有 Confirm/Return 或补偿，Lua 预扣与 MQ 发送之间仍有丢单窗口；MySQL 提交和 ACK 也非原子。本轮成功对账不等于这些故障窗口已被消除。
+
+### 6. 面试复盘
+
+1. 返回订单 ID 是否等于最终下单成功？不是；还要等 RabbitMQ 消费并核对 MySQL 订单。
+2. 429 能否计入系统错误率？限流策略正常拒绝应单独统计；503 和连接失败才表示基础设施或网络异常。
+3. 为什么 k6 的 4,927 次 429 不能全算 GLOBAL？同一 600 个 token 被反复轮换，USER 规则也会拒绝，且 k6 丢弃了 1,010 个未发出的迭代。
+4. 如何证明没有超卖或重复订单？核对初始库存减最终订单数等于 Redis/MySQL 剩余库存，资格 Set 与订单数一致，并检查 `(user_id,voucher_id)` 重复组为 0。
+5. 500 线程档的 704.23/s 能否称作秒杀容量？不能，其中 312 次未建立 HTTP 连接；该档只能说明本机入口在这种瞬时连接模型下出现失败。
+6. ready/unacked 采样峰值为 0 是否证明 RabbitMQ 从未积压？不能，100ms 采样可能漏掉更短的积压；publish/ack 总量与最终队列状态提供的是另一层证据。
+7. 为什么没有立即调整 Tomcat 或限流配置？已确认连接边界，但未分离本机网络、JMeter 与应用 accept queue 的贡献；正式限流在 JMeter 三档均未提前截断请求。
+8. 完整对账是否消除了发送可靠性风险？没有。没有生产者 Confirm/Return，Lua 预扣与 MQ 发送也不是原子步骤；本轮只能证明实测成功路径。
+
+## [2026-09-24] 秒杀连接拒绝阶梯复测：200 至 500 线程
+
+### 1. 背景 / 问题
+
+- Phase 3 的 500 线程短批次有 312 次 `Connection refused`，但缺少同步的应用、JVM、连接池、Windows TCP 与发压机 CPU 指标，无法说明拒绝从何处开始。
+
+### 2. 方案选择
+
+- 沿用原 `seckill-capacity.jmx`、正式限流阈值和每线程一个独立账号、一次请求的模型。专用券与 500 个标记账号逐档重置；200、300、400、500 线程都设 `rampUp=1s`、`duration=60s`（实际一次性请求提前完成）。同机应用/JMeter、MySQL 8.0.27、Redis 7.2、RabbitMQ 3.13 不变。
+- 隔离启动时仅启用 Tomcat/Hikari JMX MBean；新增只读本地 Attach 与 Windows 主机采样器。第一轮找边界，第二轮补整机 CPU 并验证边界是否重复。每轮 JTL 记录连接拒绝，接受数与最终订单、库存对账。采样峰值只统计与 JTL 请求起止时间重叠的窗口。
+
+### 3. 核心实现
+
+- `scripts/load-test/ObserveJvm.java` 读取 Tomcat `currentThreadsBusy/currentThreadCount/maxThreads`、Hikari `ActiveConnections/ThreadsAwaitingConnection`、JVM 进程 CPU、堆、GC 和线程数；`observe-seckill-host.ps1` 读取整机/JMeter 进程 CPU 与 8081 端口的客户端/服务端 TCP 状态。采样器输出到忽略的 `target/load-test`；README 记录复现命令和采样局限。业务代码、限流阈值与秒杀 JMeter 计划均未改变。
+- 两轮每档均为 0 个 429、0 个 503、0 个业务失败；下表错误均是 JTL 中 `HttpHostConnectException: Connection refused`。四档按顺序执行，第一轮 200 档因主机 CPU 指标未就绪另补一次 200 复测；第二轮四档均同步记录整机 CPU。
+
+| 档位 | 第一轮拒绝/请求 | 第二轮拒绝/请求 | 第二轮 Tomcat busy/max 采样峰值 | 第二轮 JVM 线程峰值 | 第二轮 Hikari active 峰值 | 第二轮整机 CPU 峰值 | 第二轮 JVM CPU 峰值 | 第二轮 JMeter 进程 CPU 峰值* | 第二轮 JVM Heap 峰值 | 第二轮 GC 增量 | 第二轮客户端 ESTABLISHED/TIME_WAIT 峰值 |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 200 | 0/200 | 0/200 | 6/200 | 217 | 1 | 80.2% | 15% | 599.1% | 105.8 MiB | 1 次 / 2ms | 200 / 200 |
+| 300 | 76/300 | 188/300 | 34/200 | 218 | 1 | 91.1% | 7% | 841.6% | 107.5 MiB | 1 次 / 3ms | 112 / 200 |
+| 400 | 126/400 | 75/400 | 180/200 | 297 | 1 | 98.8% | 15% | 603.9% | 104.8 MiB | 1 次 / 2ms | 325 / 312 |
+| 500 | 330/500 | 58/500 | 200/200 | 309 | 1 | 98.7% | 11% | 360.1% | 103.8 MiB | 1 次 / 3ms | 442 / 637 |
+
+- `*` JMeter 进程 CPU 以一个逻辑核为 100%；JVM CPU 是 `ProcessCpuLoad`，以整机可用 CPU 为分母。500 档主机采样仅命中 2 个请求窗口采样点，CPU 峰值可能明显低估。100ms 目标采样频率在同机 CPU 争用下无法保证，Tomcat 和 TCP 的短尖峰也可能漏采。第二轮 `TIME_WAIT` 的档前基数已从 200 上升到 637 左右，峰值低于千级；不能据此推断临时端口耗尽。
+- 第一轮 200/300/400/500 的 Lua 接受与最终订单分别为 200/224/274/170；第二轮分别为 200/112/325/442。每档 Redis 资格数、MySQL 订单数相等，Redis/MySQL 剩余库存均为 `500-接受数`，订单去重用户数与订单数相等。最终 RabbitMQ 主队列 ready/unacked 和错误队列均为 0。
+
+### 4. 遇到的坑
+
+- 首次探测 JMX 时 Tomcat MBean 未暴露、Hikari 池尚未初始化，采样器显示 `NA`。在隔离应用启动时启用 Tomcat/Hikari MBean，并先用独立请求触发 Hikari 后，相关指标可读；正式业务配置未改变。
+- 第一版 Hikari MBean 过滤条件误把 `type=Pool (HikariPool-1)` 当成精确 `type=Pool`，导致采样为空；按真实 ObjectName 修正并复测。第一轮主机采样器未记录整机 CPU，所以补做了第二轮完整阶梯。
+- 同样的 300/400/500 档连接拒绝数量在两轮中显著波动，且不随档位单调上升；采样间隔也在整机高负载时变长。因此只能把**本机、本配置的首次观测拒绝档**定位在 200 与 300 之间，不能写成稳定的 300 线程上限或单一组件根因。
+
+### 5. 为什么这样改
+
+- 300 档第二轮 Tomcat 忙线程峰值只有 34/200，却有 188 次连接拒绝，Hikari 活跃峰值 1、GC 仅 3ms，说明这些失败发生在业务落库之前，不能归因数据库连接池或 GC。整机 CPU 91.1%、JMeter 进程最多消耗约 8.4 核，且 400/500 档整机峰值接近 99%，同机发压资源争用是重要干扰。
+- 500 档又采到 Tomcat 忙线程 200/200；采样无法读取操作系统 accept queue，也可能漏掉更短的线程峰值。因此**不能断言只是 JMeter/Windows 网络问题，也不能断言只是 Tomcat 配置问题**。当前证据把问题定位在本机突发 HTTP 建连/接入边界；若需精确拆分，应改用独立压测机并采集服务端 accept queue/网络拒绝计数复测。
+- 不修改 Tomcat、限流或秒杀业务配置：现有数据足以说明短批次本机建连边界，却不足以选择有把握的最小配置修改。被接受的请求仍完整落库，本轮不宣称新的持续容量或性能提升。
+
+### 6. 面试复盘
+
+1. 拒绝从哪档开始？本机两轮 200 档为 0，300 档分别为 76/300、188/300；这是观测区间，不是稳定容量上限。
+2. 为什么 300 档 Tomcat busy 34/200 仍不能证明 Tomcat 无关？采样可能漏掉毫秒级峰值，而且没有 accept queue 计数。
+3. 为什么不能将高 CPU 直接归因 JMeter？应用与 JMeter 同机，整机 CPU 统计包含两者；JMeter 进程 CPU 明确显示发压端占多核，但服务端接入层也可能同时受影响。
+4. Hikari active 峰值 1 说明什么？本轮数据库连接池没有观测到明显占满，不能解释连接建立前的 `Connection refused`；该峰值同样受采样间隔限制。
+5. `TIME_WAIT` 约 637 能证明端口耗尽吗？不能，还要看可用临时端口范围、占用总数和连接失败时的系统错误；这里数值本身没有提供此证据。
+6. 为什么拒绝数不随 200→500 单调增加？同机线程调度、JMeter 发起时序与采样相位会改变瞬时建连波形，短批次没有形成稳定负载；应多次复测并分离发压机。
+7. 为什么不能把成功的 442/500 写成系统支持 442 TPS？这是单次请求数，另有 58 次连接拒绝；请求完成速率与持续稳定容量是不同指标。
+
+## [2026-09-24] 性能工作 Phase 4：证据、工程决策与面试表述收敛
+
+### 1. 背景 / 问题
+
+- SQL 基线、商铺缓存冷/热实验、秒杀正确性对账和两轮连接拒绝阶梯复测已经分别记录。最终展示需要明确区分“本轮新增的实验方法”“项目原有能力的验证”与“尚未解决的风险”，避免把本地短批次完成速率或未发生的索引/缓存改动写成优化收益。
+
+### 2. 方案选择
+
+- 不再压测或修改业务架构。工程日志保留原始条件与结果；面试笔记整理简历 bullet、30 秒/2 分钟讲述、问答与学习优先级；根 README 只给项目阅读者一个简洁的性能验证入口，复现命令继续留在 `scripts/load-test/README.md`。
+
+### 3. 核心实现
+
+- SQL：券表 1 行、笔记表 4 行；即使有 `ALL`/`Using filesort`，仍保留原索引和 SQL。`(shop_id,status)` 与排序索引只作未来代表性数据下的候选，现有 `(user_id,voucher_id)` UNIQUE 继续承担一人一单约束。
+- 缓存：已有 Pass Through 的热读轮 37,994 次请求对应 MySQL 查询 0；失效窗口 MySQL 和 SETEX 各增加 12。该证据支持缓存价值与失效风险的描述，不构成本轮新增缓存的性能提升百分比。
+- 秒杀：10/10 与 200/200 独立请求最终落单；两轮阶梯均在 300 线程档首次出现连接拒绝，而拒绝数不稳定。结论限定为本机瞬时建连/接入边界，不称作持续容量，也不单独归因 Tomcat、Windows 或 JMeter。
+- 新增的是参数化 JMeter、账号 CSV、k6 业务分类、Redis/MQ/MySQL 对账和同步资源采样等**实验能力**；Redis 商铺缓存、Lua、RabbitMQ 异步订单、UNIQUE 和两级限流是**原有能力的验证**。本阶段只编辑文档，没有新 benchmark 或业务代码改动。
+
+### 4. 遇到的坑
+
+- 本次文档收敛未遇到需要记录的实际问题；实验中的真实异常与定位过程保留在各阶段日志，不重新编造成新的踩坑。
+
+### 5. 为什么这样改
+
+- 统一“证据 → 决策 → 边界”的口径，防止将 Phase 1 写成索引提速、将 Phase 2 写成新增 Redis 提速，或将 704.23/s、442/500、200 线程无失败写成秒杀容量。没有足够证据支持联合索引、缓存锁或 Tomcat 调参，因此保留现状。
+- 已知 Redis 预扣与 MQ 发送不原子、无生产者 Confirm/Return、MySQL commit 与 MQ ACK 不原子、错误转发无发布确认且错误队列不会自动修复 Redis 状态；成功路径压测未消除这些故障窗口。SQL 判断受 1/4 行小样本限制，本地同机测试不能外推生产容量。
+
+### 6. 面试复盘
+
+1. 这一轮到底“优化”了什么？新增可复现测量与对账能力，验证原有链路并作出暂缓改动的工程决策；没有凭空新增索引或缓存机制。
+2. `ALL`/`Using filesort` 出现时为什么保留原 SQL？实际只有 1/4 行，读收益缺证据，写入维护成本真实存在。
+3. 缓存轮能写“性能提升”吗？不能；缓存原本就存在，冷轮还会在首个写回后转热，只能描述两种状态和 MySQL 压力差异。
+4. 返回 orderId 能否证明订单成功？不能；要等待 MQ 消费并核对最终 MySQL 订单、Redis 资格和两端库存。
+5. 为什么 200 线程无拒绝不是容量？单批次、单机、一次请求模型未测持续稳态与独立发压；300 档已有波动拒绝。
+6. 能否说瓶颈必然是 Tomcat？不能；整机/JMeter CPU 高，500 档 busy 采到上限，但 300 档未采到忙线程打满，且缺 accept queue 指标。
+7. 成功对账是否保证消息不丢？不保证；生产者发送及错误转发没有确认，Redis/MQ 与 MySQL/ACK 均非原子。

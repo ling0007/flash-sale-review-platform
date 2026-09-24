@@ -28,7 +28,7 @@ local redisTime = redis.call('TIME')
 local nowMillis = tonumber(redisTime[1]) * 1000 + math.floor(tonumber(redisTime[2]) / 1000)
 
 -- 将时间按 windowMillis 对齐到固定窗口左边界。
--- 例如 window=1000ms、now=1250ms，则当前窗口起点为 1000ms。
+-- 例如 window=1000ms、now=1250ms，则当前窗口起点为 1000ms。向下取整，减掉偏移量
 local currentWindowStart = nowMillis - (nowMillis % windowMillis)
 
 local storedWindowStartRaw = redis.call('HGET', key, 'current_window_start_ms')
@@ -68,6 +68,7 @@ else
 
     if currentWindowStart > storedWindowStart then
         local passedWindows = math.floor((currentWindowStart - storedWindowStart) / windowMillis)
+        --跨过0个窗口时，storedWindowStart == currentWindowStart，previousCount、currentCount不变。
         if passedWindows == 1 then
             -- 只跨过一个窗口：原来的当前窗口成为新的上一窗口。
             previousCount = currentCount
@@ -89,7 +90,7 @@ local previousWeight = (windowMillis - elapsedInCurrentWindow) / windowMillis
 local estimated = previousCount * previousWeight + currentCount
 
 local allowed = 0
--- 判断的是“加入本次请求后的估算值”。如果只判断 estimated >= limit，
+-- 判断的是“加入本次请求后的估算值”。如果只判断 estimated <= limit，
 -- estimated=4.9、limit=5 时仍会再放行一次，使放行后的估算值变成 5.9。
 if estimated + 1 <= limit then
     currentCount = currentCount + 1

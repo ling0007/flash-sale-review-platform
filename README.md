@@ -76,3 +76,9 @@ Remove-Item Env:RUN_SECKILL_INTEGRATION
 
 不要直接运行所有教学测试：原有 `HmDianPingApplicationTests` 包含大量 ID/HyperLogLog 写入和改变商铺缓存格式的用例。首次使用新 Redis 卷，可单独运行 `mvn -B '-Dtest=HmDianPingApplicationTests#loadShopData' test` 导入 GEO 索引。
 
+## 性能验证
+
+项目已对真实 MySQL 执行计划、商铺详情 Redis 缓存状态，以及秒杀 HTTP→限流→Lua→RabbitMQ→MySQL 链路完成本地实验。SQL 当前数据量过小，暂未新增索引；商铺热缓存稳态隔离了该接口的 MySQL 查询；秒杀独立账号实验完成订单、库存与消息对账，并在本机短批次 200～300 线程之间首次观察到 HTTP 连接拒绝。以上结果是指定本地条件下的验证，**不是生产持续容量或本轮新增缓存/索引带来的提速**。
+
+复现入口见 [压测脚本与步骤](scripts/load-test/README.md)，原始条件、结果及工程取舍见 [工程演进日志](docs/engineering-log.md)，面试表述见 [项目面试复盘](docs/interview-notes.md)。
+
