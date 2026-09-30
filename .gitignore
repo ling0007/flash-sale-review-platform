@@ -46,3 +46,6 @@ build/
 /docs/*
 !/docs/engineering-log*
 !/docs/readme-*
+
+# Frontend runtime uploads (bundled demo assets already tracked are retained).
+/review-frontend/imgs/blogs/
