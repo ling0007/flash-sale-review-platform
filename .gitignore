@@ -1,5 +1,15 @@
 HELP.md
 target/
+.env
+.env.*
+!.env.example
+*.log
+*.jtl
+*-tokens.csv
+!scripts/load-test/seckill-tokens.example.csv
+*-report/
+logs/
+uploads/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
@@ -31,3 +41,8 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Ignore docs by default; keep the engineering log and README assets tracked.
+/docs/*
+!/docs/engineering-log*
+!/docs/readme-*
